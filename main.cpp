@@ -108,6 +108,9 @@ struct ProcEntry
     std::string name;
     std::string label;
 
+    ProcEntry()
+    : pid(0), name("(unknown)"), label("unknown"){}
+
     ProcEntry(DWORD p, const char* n)
     : pid(p), name(n)
     {
@@ -180,18 +183,16 @@ static std::vector<ProcEntry> EnumProcesses()
     return out;
 }
 
-struct FgInfo { DWORD pid; char name[MAX_PATH]; };
-
-static FgInfo GetForegroundProcessInfo()
+static ProcEntry GetForegroundProcessInfo()
 {
-    FgInfo info{};
+    ProcEntry info{};
     HWND hwnd = GetForegroundWindow();
     if (!hwnd) return info;
     GetWindowThreadProcessId(hwnd, &info.pid);
     HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                            FALSE, info.pid);
     if (h) {
-        GetModuleBaseNameA(h, nullptr, info.name, MAX_PATH);
+        GetModuleBaseNameA(h, nullptr, info.name.data(), MAX_PATH);
         CloseHandle(h);
     }
     return info;
@@ -326,11 +327,13 @@ struct Recorder
         HRESULT hr;
         ActivationHandler handler;
 
-        if (pid == 0)
+        if (pid == 0) // Global system playback easy
         {
             /* 
                 The IMMDevice interface encapsulates 
                 the generic features of a multimedia device resource. 
+
+                in this path we enumerate the defaul device to get global system playback audio
 
             */
             IMMDeviceEnumerator *pEnum = nullptr;
@@ -360,6 +363,7 @@ struct Recorder
                 of an audio endpoint device by calling the IMMDevice::Activate method with parameter 
                 iid set to REFIID IID_IAudioClient.
              */
+            // get an audio client from the activated device
             hr = pDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
                                 nullptr, (void**)&pClient);
             pDev->Release();
@@ -393,9 +397,10 @@ struct Recorder
              */
             hr = pClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
                                      AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                    // 1second
                                      10000000, 0, &capFmt, nullptr);
         }
-        else
+        else // capture from specific process insane stuff 
         {
             capFmt = kProcFmt;
 
@@ -591,19 +596,104 @@ struct Recorder
     }
 };
 
-static Recorder               g_rec;
-static std::vector<ProcEntry> g_procs;
-static int                    g_selProc = 0;
-static char                   g_procFilter[128] = {};
-
-static void FrameToTimeStr(int64_t frame, uint32_t sampleRate, char *buf, size_t bufsz)
+struct Player
 {
-    if (sampleRate == 0) { snprintf(buf, bufsz, "0:00.000"); return; }
-    double secs  = (double)frame / (double)sampleRate;
-    int    m     = (int)(secs / 60.0);
-    double s     = secs - m * 60.0;
-    snprintf(buf, bufsz, "%d:%06.3f", m, s);
-}
+    IAudioClient       *pClient  = nullptr;
+    IAudioRenderClient *pRender  = nullptr;
+    std::thread         thread;
+    std::atomic<bool>   stopReq{false};
+    std::atomic<size_t> cursor{0};   // bytes consumed so far
+    size_t              totalBytes{0}; // set at Start()
+
+    // Takes a reference to the recorder's buffer + format
+    bool Start(const std::vector<uint8_t>& pcm,
+               const WAVEFORMATEX& fmt,
+               int64_t frameStart, int64_t frameEnd)
+    {
+        IMMDeviceEnumerator *pEnum = nullptr;
+        IMMDevice           *pDev  = nullptr;
+
+        CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                         CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
+
+        // eRender + eConsole = default speakers/headphones
+        pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDev);
+        pEnum->Release();
+
+        pDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pClient);
+        pDev->Release();
+
+        // Use the same format the recorder captured at
+        pClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                            0,           // no special flags for render
+                            10000000, 0, &fmt, nullptr);
+
+        pClient->GetService(__uuidof(IAudioRenderClient), (void**)&pRender);
+
+        // Copy the cropped slice out so the thread owns it
+        int frameBytes = fmt.nBlockAlign;
+        size_t byteStart = frameStart * frameBytes;
+        size_t byteEnd   = frameEnd   * frameBytes;
+        std::vector<uint8_t> slice(pcm.begin() + byteStart,
+                                   pcm.begin() + byteEnd);
+
+        pClient->Start();
+        stopReq = false;
+        thread  = std::thread([this, slice = std::move(slice), fmt]() mutable {
+            ThreadFunc(slice, fmt);
+        });
+        return true;
+    }
+
+    void ThreadFunc(const std::vector<uint8_t>& slice, const WAVEFORMATEX& fmt)
+    {
+        totalBytes = slice.size();
+        UINT32 bufferFrames = 0;
+        pClient->GetBufferSize(&bufferFrames); // engine's buffer size
+
+        cursor = 0; // byte offset into slice
+        int frameBytes = fmt.nBlockAlign;
+
+        while (!stopReq && cursor < slice.size())
+        {
+            Sleep(10);
+
+            UINT32 padding = 0;
+            pClient->GetCurrentPadding(&padding); // frames already queued
+
+            UINT32 available = bufferFrames - padding; // frames we can write
+            if (available == 0) continue;
+
+            // Don't write more than what's left in the slice
+            size_t bytesLeft     = slice.size() - cursor;
+            UINT32 framesToWrite = (UINT32)std::min(
+                (size_t)available,
+                bytesLeft / (size_t)frameBytes
+            );
+            if (framesToWrite == 0) break;
+
+            BYTE *pData = nullptr;
+            if (FAILED(pRender->GetBuffer(framesToWrite, &pData))) break;
+
+            memcpy(pData, slice.data() + cursor, framesToWrite * frameBytes);
+            cursor += framesToWrite * frameBytes;
+
+            pRender->ReleaseBuffer(framesToWrite, 0);
+        }
+
+        // Let the buffer drain before stopping
+        Sleep(200);
+        pClient->Stop();
+    }
+
+    void Stop()
+    {
+        stopReq = true;
+        if (thread.joinable()) thread.join();
+        if (pClient)  { pClient->Stop(); pClient->Release();  pClient  = nullptr; }
+        if (pRender)  { pRender->Release(); pRender = nullptr; }
+    }
+};
 
 static void DrawWaveform(ImDrawList        *dl,
                          ImVec2             canvasPos,
@@ -785,138 +875,211 @@ static void DrawWaveform(ImDrawList        *dl,
     }
 }
 
-void RecorderWindow()
+static void TextCentered(const char* text)
 {
-    RecState rs = g_rec.state.load();
+    float w = ImGui::CalcTextSize(text).x;
+    float avail = ImGui::GetContentRegionAvail().x;
 
-    if (rs == RecState::Recording)
-        g_rec.recordSecs = g_rec.pausedSecs +
-                           (GetTickCount() - g_rec.startTick) / 1000.f;
+    ImGui::SetCursorPosX((avail - w) * 0.5f);
+    ImGui::TextUnformatted(text);
+}
 
-    /* ------------------------------------------------------------------ */
-    ImGui::Begin("Audio Recorder");
+static void TextCentered(const char* text, float height)
+{
+    float text_w = ImGui::CalcTextSize(text).x;
+    float text_h = ImGui::GetTextLineHeight();
+
+    float avail_w = ImGui::GetContentRegionAvail().x;
+
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail_w - text_w) * 0.5f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (height - text_h) * 0.5f);
+
+    ImGui::TextUnformatted(text);
+}
+
+static void TextCenteredColored(const char* text, ImVec4 col)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+        TextCentered(text);
+    ImGui::PopStyleColor();
+}
+
+static void TextCenteredColored(const char* text, ImVec4 col, float height)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+        TextCentered(text, height);
+    ImGui::PopStyleColor();
+}
+
+
+bool ButtonColored(const char* label,
+                          const ImVec2& size,
+                          ImVec4 &col,
+                          ImVec4 &hovered,
+                          ImVec4 &active)
+{
+    ImGui::PushStyleColor(ImGuiCol_Button,        col);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  active);
+
+    bool pressed = ImGui::Button(label, size);
+
+    ImGui::PopStyleColor(3);
+    return pressed;
+}
+
+static float BlinkAlpha(float speed = 0.002f, float minAlpha = 0.3f, float maxAlpha = 1.0f)
+{
+    float t = (float)GetTickCount() * speed;
+    return (sinf(t) > 0.0f) ? maxAlpha : minAlpha;
+}
+
+inline float CalcHBlockItemWidth(int count)
+{
+    float avail = ImGui::GetContentRegionAvail().x;
+    float sp    = ImGui::GetStyle().ItemSpacing.x;
+    return (avail - sp * (count - 1)) / count;
+}
+
+struct RecorderWindow
+{
+    Recorder                      g_rec;
+    RecState                      rs = RecState::Idle; 
+    std::vector<ProcEntry>        g_procs;
+    int                           g_selProc = 0;
+    char                          g_procFilter[128];
+    std::vector<uint8_t>          s_snap;
+    RecState                      s_lastRs = RecState::Idle;
+    ProcEntry                     fg;
+    DWORD                         lastPollTick = 0;
+    ImGuiTextFilter filter;
+
+    DWORD s;
+    DWORD h;
+    DWORD m;
+
+    ImVec4 startCol         = ImVec4(0.15f, 0.55f, 0.25f, 1.f);
+    ImVec4 startHoverCol    = ImVec4(0.20f, 0.70f, 0.30f, 1.f);
+    ImVec4 startActiveCol   = ImVec4(0.10f, 0.40f, 0.18f, 1.f);
+
+    ImVec4 pauseCol         = ImVec4(0.15f, 0.45f, 0.75f, 1.f);
+    ImVec4 pauseHoverCol    = ImVec4(0.20f, 0.60f, 0.95f, 1.f);
+    ImVec4 pauseActiveCol   = ImVec4(0.10f, 0.35f, 0.55f, 1.f);
+
+    ImVec4 resumeCol        = ImVec4(0.15f, 0.45f, 0.75f, 1.f);
+    ImVec4 resumeHoverCol   = ImVec4(0.20f, 0.60f, 0.95f, 1.f);
+    ImVec4 resumeActiveCol  = ImVec4(0.10f, 0.35f, 0.55f, 1.f);
+
+    ImVec4 stopCol          = ImVec4(0.65f, 0.15f, 0.15f, 1.f);
+    ImVec4 stopHoverCol     = ImVec4(0.85f, 0.20f, 0.20f, 1.f);
+    ImVec4 stopActiveCol    = ImVec4(0.45f, 0.10f, 0.10f, 1.f);
+
+    ImVec4 saveCol          = ImVec4(0.15f, 0.55f, 0.25f, 1.f);
+    ImVec4 saveHoverCol     = ImVec4(0.20f, 0.70f, 0.30f, 1.f);
+    ImVec4 saveActiveCol    = ImVec4(0.10f, 0.40f, 0.18f, 1.f);
+
+    ImVec4 discardCol          = ImVec4(0.15f, 0.55f, 0.25f, 1.f);
+    ImVec4 discardHoverCol     = ImVec4(0.20f, 0.70f, 0.30f, 1.f);
+    ImVec4 discardActiveCol    = ImVec4(0.10f, 0.40f, 0.18f, 1.f);
+
+    ImVec4 selectCol          = ImVec4(0.15f,0.40f,0.60f,1.f);
+    ImVec4 selectHoverCol     = ImVec4(0.20f,0.55f,0.80f,1.f);
+    ImVec4 selectActiveCol    = ImVec4(0.10f,0.28f,0.45f,1.f);
+
+    void DrawTimer()
     {
-        DWORD s  = (DWORD)g_rec.recordSecs;
-        DWORD h  = s / 3600; s %= 3600;
-        DWORD m  = s / 60;   s %= 60;
+        s  = (DWORD)g_rec.recordSecs;
+        h  = s / 3600; s %= 3600;
+        m  = s / 60;   s %= 60;
         char buf[32];
         snprintf(buf, sizeof(buf), "%02u:%02u:%02u", h, m, s);
         ImGui::SetWindowFontScale(8.0f);
-        float w = ImGui::CalcTextSize(buf).x;
-        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) * 0.5f);
-        ImGui::TextUnformatted(buf);
+            TextCentered(buf);
         ImGui::SetWindowFontScale(1.0f);
     }
 
-    ImGui::Spacing();
-
-    if (rs == RecState::Recording) {
-        float alpha = (sinf((float)GetTickCount() / 500.f * 3.14159f) > 0.f) ? 1.f : 0.3f;
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.2f, 0.2f, alpha));
-        float w = ImGui::CalcTextSize("● RECORDING").x;
-        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) * 0.5f);
-        ImGui::TextUnformatted("● RECORDING");
-        ImGui::PopStyleColor();
-    } else if (rs == RecState::Paused) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.75f, 0.f, 1.f));
-        float w = ImGui::CalcTextSize("⏸ PAUSED").x;
-        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) * 0.5f);
-        ImGui::TextUnformatted("⏸ PAUSED");
-        ImGui::PopStyleColor();
-    } else if (rs == RecState::ReadyToExport) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.9f, 0.5f, 1.f));
-        float w = ImGui::CalcTextSize("✂ CROP & SAVE").x;
-        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) * 0.5f);
-        ImGui::TextUnformatted("✂ CROP & SAVE");
-        ImGui::PopStyleColor();
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1.f));
-        float w = ImGui::CalcTextSize("◼ IDLE").x;
-        ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) * 0.5f);
-        ImGui::TextUnformatted("◼ IDLE");
-        ImGui::PopStyleColor();
-    }
-  
-    bool isIdle          = (rs == RecState::Idle);
-    bool isReadyToExport = (rs == RecState::ReadyToExport);
-
-    float avail = ImGui::GetContentRegionAvail().x;
-    float sp    = ImGui::GetStyle().ItemSpacing.x;
-    float btnW3 = (avail - sp * 2) / 3.f;
-
-    if (!isReadyToExport)
+    void DrawRecordingStateIndicator()
     {
-        ImGui::BeginDisabled(!isIdle || g_procs.empty());
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.55f, 0.25f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.70f, 0.30f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.10f, 0.40f, 0.18f, 1.f));
-        if (ImGui::Button("▶  Start", ImVec2(btnW3, 40)))
+        if (rs == RecState::Recording) 
         {
-            DWORD pid = g_procs.empty() ? 0 : g_procs[g_selProc].pid;
-            if (!g_rec.Start(pid))
-                g_rec.statusMsg = "Failed to start. " + g_rec.statusMsg;
+            TextCenteredColored("● RECORDING", ImVec4(1.f, 0.2f, 0.2f, BlinkAlpha()));
+        } 
+        else if (rs == RecState::Paused) 
+        {
+            TextCenteredColored("⏸ PAUSED", ImVec4(1.f, 0.75f, 0.f, 1.f));
+        } 
+        else if (rs == RecState::ReadyToExport) 
+        {
+            TextCenteredColored("✂ CROP & SAVE", ImVec4(0.3f, 0.9f, 0.5f, 1.f));
+        } 
+        else 
+        {
+            TextCenteredColored("◼ IDLE",ImVec4(0.5f, 0.5f, 0.5f, 1.f));
         }
-        ImGui::PopStyleColor(3);
+    }
+
+    void DrawRecordingController()
+    {
+        float width = CalcHBlockItemWidth(3);
+
+        ImGui::BeginDisabled(!(rs == RecState::Idle) || g_procs.empty());
+            if (ButtonColored("▶  Start", ImVec2(width, 40),
+                            startCol, startHoverCol, startActiveCol))
+            {
+                DWORD pid = g_procs.empty() ? 0 : g_procs[g_selProc].pid;
+                if (!g_rec.Start(pid))
+                    g_rec.statusMsg = "Failed to start. " + g_rec.statusMsg;
+            }
         ImGui::EndDisabled();
 
         ImGui::SameLine();
 
         /* Pause / Resume */
         bool canPause = (rs == RecState::Recording || rs == RecState::Paused);
+        bool isPaused = (rs == RecState::Paused); 
+
         ImGui::BeginDisabled(!canPause);
-        const char *pauseLbl = (rs == RecState::Paused) ? "▶  Resume" : "⏸  Pause";
-        ImVec4 pauseCol  = (rs == RecState::Paused)
-                           ? ImVec4(0.15f, 0.45f, 0.75f, 1.f)
-                           : ImVec4(0.65f, 0.55f, 0.05f, 1.f);
-        ImVec4 pauseHov  = (rs == RecState::Paused)
-                           ? ImVec4(0.20f, 0.60f, 0.95f, 1.f)
-                           : ImVec4(0.85f, 0.72f, 0.07f, 1.f);
-        ImVec4 pauseAct  = (rs == RecState::Paused)
-                           ? ImVec4(0.10f, 0.35f, 0.55f, 1.f)
-                           : ImVec4(0.50f, 0.42f, 0.04f, 1.f);
-        ImGui::PushStyleColor(ImGuiCol_Button,        pauseCol);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, pauseHov);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  pauseAct);
-        if (ImGui::Button(pauseLbl, ImVec2(btnW3, 40)))
-            g_rec.TogglePause();
-        ImGui::PopStyleColor(3);
+            if (ButtonColored((isPaused) ? "▶  Resume" : "⏸  Pause",
+                            ImVec2(width, 40),
+                            (isPaused)? resumeCol: pauseCol,
+                            (isPaused)? resumeHoverCol: pauseHoverCol,
+                            (isPaused)? resumeActiveCol: pauseActiveCol))
+            {
+                g_rec.TogglePause();
+            }
         ImGui::EndDisabled();
 
         ImGui::SameLine();
 
-        /* Stop */
-        ImGui::BeginDisabled(isIdle);
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.65f, 0.15f, 0.15f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.20f, 0.20f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.45f, 0.10f, 0.10f, 1.f));
-        if (ImGui::Button("■  Stop", ImVec2(btnW3, 40)))
-            g_rec.Stop();
-        ImGui::PopStyleColor(3);
+        ImGui::BeginDisabled(rs == RecState::Idle);
+            if(ButtonColored("■  Stop", ImVec2(width, 40), 
+                            stopCol, stopHoverCol, stopActiveCol))
+            {
+                g_rec.Stop();
+            }
         ImGui::EndDisabled();
 
-        /* PCM size + format indicator */
-        if (!isIdle)
-        {
-            size_t bytes;
-            { std::lock_guard<std::mutex> lk(g_rec.pcmMtx); bytes = g_rec.pcm.size(); }
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.8f, 0.5f, 1.f));
-            char buf[128];
-            snprintf(buf, sizeof(buf),
-                     "Captured: %.1f MB   |   %u Hz / %u-bit / %uch",
-                     bytes / 1048576.0,
-                     (unsigned)g_rec.capFmt.nSamplesPerSec,
-                     (unsigned)g_rec.capFmt.wBitsPerSample,
-                     (unsigned)g_rec.capFmt.nChannels);
-            ImGui::TextUnformatted(buf);
-            ImGui::PopStyleColor();
-        }
     }
-    else
-    {
-        static std::vector<uint8_t> s_snap;
-        static RecState             s_lastRs = RecState::Idle;
 
+    void DrawCaptureStatusInfo()
+    {
+        size_t bytes;
+        { 
+            std::lock_guard<std::mutex> lk(g_rec.pcmMtx);
+            bytes = g_rec.pcm.size(); 
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                "Captured: %.1f MB   |   %u Hz / %u-bit / %uch",
+                bytes / 1048576.0,
+                (unsigned)g_rec.capFmt.nSamplesPerSec,
+                (unsigned)g_rec.capFmt.wBitsPerSample,
+                (unsigned)g_rec.capFmt.nChannels);
+        TextCenteredColored(buf, ImVec4(0.5f, 0.8f, 0.5f, 1.f));
+    }
+
+    void DrawExportController()
+    {
         if (s_lastRs != RecState::ReadyToExport)
         {
             std::lock_guard<std::mutex> lk(g_rec.pcmMtx);
@@ -924,85 +1087,76 @@ void RecorderWindow()
         }
         s_lastRs = rs;
 
-        /* Save + Discard buttons */
-        float btnW2 = (avail - sp) / 2.f;
-
-        /* Save */
+        float w = CalcHBlockItemWidth(2);
         bool hasRange = (g_rec.cropFrameEnd > g_rec.cropFrameStart);
+
         ImGui::BeginDisabled(!hasRange);
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.55f, 0.25f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.70f, 0.30f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.10f, 0.40f, 0.18f, 1.f));
-        if (ImGui::Button("Save WAV", ImVec2(btnW2, 40)))
-        {
-            nfdchar_t  *outPath = nullptr;
-            nfdfilteritem_t filters[] = {{ "WAV Audio", "wav" }};
-            nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1,
-                                                nullptr, "recording.wav");
-            if (result == NFD_OKAY && outPath)
+            if(ButtonColored("Save WAV", ImVec2(w, 40), 
+                            saveCol, saveHoverCol, saveActiveCol))
             {
-                std::string path = outPath;
-                if (path.size() < 4 || path.substr(path.size()-4) != ".wav")
-                    path += ".wav";
-
-                /* Convert frame indices to byte offsets.
-                   nBlockAlign is the number of bytes per frame. */
-                size_t frameBytes  = (size_t)g_rec.capFmt.nBlockAlign;
-                size_t byteStart   = (size_t)g_rec.cropFrameStart * frameBytes;
-                size_t byteEnd     = (size_t)g_rec.cropFrameEnd   * frameBytes;
-
-                /* Clamp to actual pcm size (defensive) */
-                if (byteEnd > s_snap.size()) byteEnd = s_snap.size();
-
-                if (Wav::ExportRange(path, s_snap, byteStart, byteEnd, g_rec.capFmt))
+                nfdchar_t  *outPath = nullptr;
+                nfdfilteritem_t filters[] = {{ "WAV Audio", "wav" }};
+                nfdresult_t result = NFD_SaveDialog(&outPath, filters, 1,
+                                                    nullptr, "recording.wav");
+                if (result == NFD_OKAY && outPath)
                 {
-                    g_rec.statusMsg = "Saved: " + path;
-                    /* Clear and return to Idle */
-                    s_snap.clear();
-                    s_lastRs = RecState::Idle;
-                    g_rec.Discard();
+                    std::string path = outPath;
+                    if (path.size() < 4 || path.substr(path.size()-4) != ".wav"){
+                        path += ".wav";
+                    }
+
+                    // nBlockAlign is the number of bytes per frame. 
+                    size_t frameBytes  = (size_t)g_rec.capFmt.nBlockAlign;
+                    size_t byteStart   = (size_t)g_rec.cropFrameStart * frameBytes;
+                    size_t byteEnd     = (size_t)g_rec.cropFrameEnd   * frameBytes;
+
+                    if (byteEnd > s_snap.size()){
+                        byteEnd = s_snap.size();
+                    }
+
+                    if (Wav::ExportRange(path, s_snap, byteStart, byteEnd, g_rec.capFmt))
+                    {
+                        g_rec.statusMsg = "Saved: " + path;
+                        /* Clear and return to Idle */
+                        s_snap.clear();
+                        s_lastRs = RecState::Idle;
+                        g_rec.Discard();
+                    }
+                    else
+                    {
+                        g_rec.statusMsg = "Save failed!";
+                    }
+                    NFD_FreePath(outPath);
                 }
                 else
                 {
-                    g_rec.statusMsg = "Save failed!";
+                    g_rec.statusMsg = "Save cancelled.";
                 }
-                NFD_FreePath(outPath);
+
             }
-            else
-            {
-                g_rec.statusMsg = "Save cancelled.";
-            }
-        }
-        ImGui::PopStyleColor(3);
         ImGui::EndDisabled();
 
         ImGui::SameLine();
 
-        /* Discard */
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.45f, 0.15f, 0.15f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.20f, 0.20f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.30f, 0.10f, 0.10f, 1.f));
-        if (ImGui::Button("Discard", ImVec2(btnW2, 40)))
+        if(ButtonColored("Discard", ImVec2(w, 40), discardCol, discardHoverCol, discardActiveCol))
         {
             s_snap.clear();
             s_lastRs = RecState::Idle;
             g_rec.Discard();
         }
-        ImGui::PopStyleColor(3);
     }
 
-    /* ---- Status message (always visible) ---- */
-    if (!g_rec.statusMsg.empty()) {
-        ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.5f, 1.f));
-        ImGui::TextWrapped("%s", g_rec.statusMsg.c_str());
-        ImGui::PopStyleColor();
+    void DrawStatusMessage()
+    {
+        if (!g_rec.statusMsg.empty()) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.5f, 1.f));
+            ImGui::TextWrapped("%s", g_rec.statusMsg.c_str());
+            ImGui::PopStyleColor();
+        }
     }
 
-    ImGui::Spacing();
-    ImGui::Separator();
-
-    /* ---- Waveform ---- */
+    void DrawWaveformEditor()
     {
         const float WAVE_H = 100.0f;
         const float panelW = ImGui::GetContentRegionAvail().x;
@@ -1012,135 +1166,206 @@ void RecorderWindow()
 
         std::vector<uint8_t> displaySnap;
 
-        int64_t selF0 = 0, selF1 = 0;
-
-        if (isReadyToExport)
-        {
-            std::lock_guard<std::mutex> lk(g_rec.pcmMtx);
-            displaySnap = g_rec.pcm;
-            selF0 = g_rec.cropFrameStart;
-            selF1 = g_rec.cropFrameEnd;
-        }
-        else
-        {
-            std::lock_guard<std::mutex> lk(g_rec.pcmMtx);
-            displaySnap = g_rec.pcm;
-            /* No crop highlight during recording */
-            selF0 = 0;
-            selF1 = 0;
-        }
+        std::lock_guard<std::mutex> lk(g_rec.pcmMtx);
+        displaySnap = g_rec.pcm;
 
         DrawWaveform(dl, canvas_pos, panelW, WAVE_H,
                      displaySnap, g_rec.capFmt, rs, &g_rec.cropFrameStart, &g_rec.cropFrameEnd);
     }
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
 
-    if (!isReadyToExport)
+    void DrawProcFgSelect()
     {
-        static FgInfo fg{};
-        static DWORD  lastPollTick = 0;
+        if(!(rs == RecState::ReadyToExport))
+        {
+            bool isSelf = (fg.pid == GetCurrentProcessId());
+
+            char fgBuf[MAX_PATH + 64];
+            if (isSelf || !fg.pid)
+            {
+                snprintf(fgBuf, sizeof(fgBuf), "Active window:  (this recorder)");
+            }
+            else
+            {
+                snprintf(fgBuf, sizeof(fgBuf),
+                        "Active window:  %s   [PID %lu]",
+                        fg.name.c_str()[0] ? fg.name.c_str() : "?", (unsigned long)fg.pid);
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                isSelf ? ImVec4(0.18f, 0.18f, 0.18f, 1.f)
+                    : ImVec4(0.10f, 0.22f, 0.35f, 1.f));
+
+            int fg_proc_status_h = 36;
+
+            ImGui::BeginChild("##fgbar", ImVec2(0, fg_proc_status_h), false,
+                            ImGuiWindowFlags_NoScrollbar);
+                
+                TextCenteredColored(fgBuf,isSelf ? ImVec4(0.45f, 0.45f, 0.45f, 1.f)
+                : ImVec4(0.55f, 0.85f, 1.00f, 1.f),fg_proc_status_h);
+
+                if (!isSelf && fg.pid && (rs == RecState::Idle))
+                {
+                    ImGui::SameLine(ImGui::GetContentRegionAvail().x
+                            - ImGui::CalcTextSize("Select").x - 16.f);
+                    if(ButtonColored("Select", ImVec2(0, 30), selectCol, selectHoverCol, selectActiveCol))
+                    {
+                        auto findPid = [&]() -> bool {
+                            for (int i = 0; i < (int)g_procs.size(); ++i)
+                                if (g_procs[i].pid == fg.pid) { g_selProc = i; return true; }
+                            return false;
+                        };
+                        if (!findPid()) {
+                            g_procs = EnumProcesses();
+                            g_procFilter[0] = '\0';
+                            findPid();
+                        }
+                    }
+                }
+
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+        }
+    }
+
+    void DrawProcSelect()
+    {
+        if (!(rs==RecState::ReadyToExport))
+        {
+            ImGui::BeginDisabled(!(rs==RecState::Idle));
+
+                if (ImGui::Button("↺ Refresh processes"))
+                {
+                    g_procs    = EnumProcesses();
+                    g_selProc  = 0;
+                    g_procFilter[0] = '\0';
+                }
+                ImGui::SameLine();
+
+                filter.Draw("##filter", 200.0f); 
+
+                std::vector<int> filtered;
+                for (int i = 0; i < (int)g_procs.size(); ++i)
+                {
+                    if (filter.PassFilter(g_procs[i].label.c_str()))
+                    {
+                        filtered.push_back(i);
+                    }
+                }
+
+                bool selVisible = false;
+                for (int fi : filtered)
+                {
+                    if (fi == g_selProc) 
+                    { 
+                        selVisible = true;
+                        break; 
+                    }
+                }
+                if (!selVisible && !filtered.empty())
+                {
+                    g_selProc = filtered[0];
+                }
+
+                const char *preview = g_procs.empty() ? "(none)" : g_procs[g_selProc].label.c_str();
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##proc", preview))
+                {
+                    for (int fi : filtered)
+                    {
+                        bool sel = (fi == g_selProc);
+                        if (ImGui::Selectable(g_procs[fi].label.c_str(), sel))
+                            g_selProc = fi;
+                        if (sel) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+            ImGui::EndDisabled();
+        }
+    }
+
+    void Update()
+    {
+        rs = g_rec.state.load();
+        if (rs == RecState::Recording)
+        {
+            g_rec.recordSecs = g_rec.pausedSecs +
+                              (GetTickCount() - g_rec.startTick) / 1000.f;
+        }
+
         DWORD now = GetTickCount();
         if (now - lastPollTick > 500) { fg = GetForegroundProcessInfo(); lastPollTick = now; }
 
-        bool isSelf = (fg.pid == GetCurrentProcessId());
+    }
 
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-            isSelf ? ImVec4(0.18f, 0.18f, 0.18f, 1.f)
-                   : ImVec4(0.10f, 0.22f, 0.35f, 1.f));
-        ImGui::BeginChild("##fgbar", ImVec2(0, 36), false,
-                          ImGuiWindowFlags_NoScrollbar);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4.f);
+    void Init()
+    {
+        g_procs   = EnumProcesses();
+        g_selProc = 0;
+    }
 
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            isSelf ? ImVec4(0.45f, 0.45f, 0.45f, 1.f)
-                   : ImVec4(0.55f, 0.85f, 1.00f, 1.f));
+    void Draw()
+    {
+        ImGui::Begin("Audio Recorder");
 
-        char fgBuf[MAX_PATH + 64];
-        if (isSelf || !fg.pid)
-            snprintf(fgBuf, sizeof(fgBuf), "Active window:  (this recorder)");
-        else
-            snprintf(fgBuf, sizeof(fgBuf),
-                     "Active window:  %s   [PID %lu]",
-                     fg.name[0] ? fg.name : "?", (unsigned long)fg.pid);
-        ImGui::TextUnformatted(fgBuf);
-        ImGui::PopStyleColor();
+            DrawTimer();
 
-        if (!isSelf && fg.pid && isIdle)
-        {
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x
-                            - ImGui::CalcTextSize("Select").x - 16.f);
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f,0.40f,0.60f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.55f,0.80f,1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.10f,0.28f,0.45f,1.f));
-            if (ImGui::Button("Select"))
+            ImGui::Spacing();
+
+            DrawRecordingStateIndicator();
+
+            if (!(rs == RecState::ReadyToExport))
             {
-                auto findPid = [&]() -> bool {
-                    for (int i = 0; i < (int)g_procs.size(); ++i)
-                        if (g_procs[i].pid == fg.pid) { g_selProc = i; return true; }
-                    return false;
-                };
-                if (!findPid()) {
-                    g_procs = EnumProcesses();
-                    g_procFilter[0] = '\0';
-                    findPid();
+                DrawRecordingController();
+
+                ImGui::Spacing();
+
+                if (rs == RecState::Idle)
+                {
+                    DrawCaptureStatusInfo();
                 }
             }
-            ImGui::PopStyleColor(3);
-        }
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-    }
-
-    if (!isReadyToExport)
-    {
-        ImGui::BeginDisabled(!isIdle);
-
-        if (ImGui::Button("↺ Refresh processes"))
-        {
-            g_procs    = EnumProcesses();
-            g_selProc  = 0;
-            g_procFilter[0] = '\0';
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(180);
-        ImGui::InputTextWithHint("##filter", "Filter...", g_procFilter, sizeof(g_procFilter));
-
-        std::vector<int> filtered;
-        for (int i = 0; i < (int)g_procs.size(); ++i)
-        {
-            if (!g_procFilter[0] ||
-                strstr(g_procs[i].label.c_str(), g_procFilter) != nullptr)
-                filtered.push_back(i);
-        }
-
-        bool selVisible = false;
-        for (int fi : filtered) if (fi == g_selProc) { selVisible = true; break; }
-        if (!selVisible && !filtered.empty()) g_selProc = filtered[0];
-
-        const char *preview = g_procs.empty() ? "(none)" : g_procs[g_selProc].label.c_str();
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::BeginCombo("##proc", preview))
-        {
-            for (int fi : filtered)
-            {
-                bool sel = (fi == g_selProc);
-                if (ImGui::Selectable(g_procs[fi].label.c_str(), sel))
-                    g_selProc = fi;
-                if (sel) ImGui::SetItemDefaultFocus();
+            else
+            {   
+                DrawExportController();
             }
-            ImGui::EndCombo();
-        }
+            DrawStatusMessage();
 
-        ImGui::EndDisabled();
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            DrawWaveformEditor();
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            DrawProcFgSelect();
+
+            ImGui::Spacing();
+
+            DrawProcSelect();
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+        ImGui::End();
     }
-    ImGui::End();
-}
+
+    void Cleanup()
+    {
+        RecState cur = g_rec.state.load();
+        if (cur == RecState::Recording || cur == RecState::Paused)
+        {
+            g_rec.stopReq = true;
+            if (cur == RecState::Paused && g_rec.pClient) g_rec.pClient->Start();
+            if (g_rec.thread.joinable()) g_rec.thread.join();
+            g_rec.Cleanup();
+        }
+    }
+};
 
 const char *glsl_version = "#version 130";
 
@@ -1152,8 +1377,9 @@ int main(int, char **)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-    g_procs   = EnumProcesses();
-    g_selProc = 0;
+    RecorderWindow recorder;
+
+    recorder.Init();
 
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) return 1;
@@ -1204,9 +1430,12 @@ int main(int, char **)
 
     ImVec4 clear_color{0.12f, 0.12f, 0.14f, 1.f};
 
-    while (!glfwWindowShouldClose(window)) {
+    while (!glfwWindowShouldClose(window)) 
+    {
         glfwPollEvents();
-        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
+        recorder.Update();
+        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) 
+        {
             ImGui_ImplGlfw_Sleep(10); continue;
         }
 
@@ -1233,7 +1462,7 @@ int main(int, char **)
             ImGui::End();
         }
 
-        RecorderWindow();
+        recorder.Draw();
 
         ImGui::Render();
         int fw, fh;
@@ -1252,16 +1481,7 @@ int main(int, char **)
         glfwSwapBuffers(window);
     }
 
-    {
-        RecState cur = g_rec.state.load();
-        if (cur == RecState::Recording || cur == RecState::Paused)
-        {
-            g_rec.stopReq = true;
-            if (cur == RecState::Paused && g_rec.pClient) g_rec.pClient->Start();
-            if (g_rec.thread.joinable()) g_rec.thread.join();
-            g_rec.Cleanup();
-        }
-    }
+    recorder.Cleanup();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
