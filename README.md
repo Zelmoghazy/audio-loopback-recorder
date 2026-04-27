@@ -3,7 +3,7 @@
 * Per process playback audio recording.
     * Choose either system wide recording or pick the active process or choose from a list
 * Custom DearImGui waveform editing widget.
-* Crop and export recording in WAV format
+* Crop, play and export recording in WAV format.
 
 <p align="center">
   <img src="./docs/image1.png"
