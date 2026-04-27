@@ -127,7 +127,7 @@ struct ProcEntry
 /*
     https://learn.microsoft.com/en-us/windows/win32/psapi/enumerating-all-processes 
  */
-static std::vector<ProcEntry> EnumProcesses()
+static std::vector<ProcEntry> EnumProcesses(void)
 {
     std::vector<ProcEntry> out;
     out.push_back({ 0, "(System / All)", "(System / All)" });
@@ -162,7 +162,7 @@ static std::vector<ProcEntry> EnumProcesses()
         HMODULE hMod;
         DWORD cbNeeded;
         // Get a handle to the module
-        if (EnumProcessModules(h, &hMod, sizeof(hMod), &cbNeeded) )
+        if (EnumProcessModules(h, &hMod, sizeof(hMod), &cbNeeded))
         {
             char buf[MAX_PATH] = {};
             if (GetModuleBaseNameA(h, hMod, buf, MAX_PATH) && buf[0])
@@ -183,7 +183,7 @@ static std::vector<ProcEntry> EnumProcesses()
     return out;
 }
 
-static ProcEntry GetForegroundProcessInfo()
+static ProcEntry GetForegroundProcessInfo(void)
 {
     ProcEntry info{};
     HWND hwnd = GetForegroundWindow();
@@ -639,13 +639,14 @@ struct Player
     IAudioClient       *pClient  = nullptr;
     IAudioRenderClient *pRender  = nullptr;
     std::thread         thread;
-    std::atomic<bool>   stopReq{false};
-std::atomic<bool> playing{false};
-    std::atomic<size_t> cursor{0};      // bytes consumed so far
-    size_t              totalBytes{0};  // set at Start()
-    IAudioClock        *pClock   = nullptr;
+    HANDLE              hEvent   = nullptr;   // WASAPI signals this when hungry
+    HANDLE              hStop    = nullptr;   // we signal this to kill the thread
 
-    // Takes a reference to the recorder's buffer + format
+    std::atomic<bool>   playing{false};
+    std::atomic<size_t> cursor{0};            // bytes consumed so far
+    size_t              totalBytes{0};          
+    IAudioClock         *pClock   = nullptr;
+
     bool Start(const std::vector<uint8_t>& pcm,
                const WAVEFORMATEX& fmt,
                int64_t frameStart, int64_t frameEnd)
@@ -656,7 +657,6 @@ std::atomic<bool> playing{false};
         CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
                          CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
 
-        // eRender + eConsole = default speakers/headphones
         pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDev);
         pEnum->Release();
 
@@ -665,109 +665,162 @@ std::atomic<bool> playing{false};
 
         // Use the same format the recorder captured at
         pClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                            0,           // no special flags for render
+                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                             10000000, 0, &fmt, nullptr);
 
+        hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset
+        hStop  = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        pClient->SetEventHandle(hEvent);
+
         pClient->GetService(__uuidof(IAudioRenderClient), (void**)&pRender);
-        pClient->GetService(__uuidof(IAudioClock), (void**)&pClock);  // add this
-        // Copy the cropped slice out so the thread owns it
+        pClient->GetService(__uuidof(IAudioClock), (void**)&pClock);
+
         int frameBytes = fmt.nBlockAlign;
         size_t byteStart = frameStart * frameBytes;
         size_t byteEnd   = frameEnd   * frameBytes;
         std::vector<uint8_t> slice(pcm.begin() + byteStart,
                                    pcm.begin() + byteEnd);
 
+        totalBytes = slice.size();
+
+        PrefillBuffer(slice, fmt);
+
         pClient->Start();
-        stopReq = false;
         playing = true;
+
         thread  = std::thread([this, slice = std::move(slice), fmt]() mutable {
             ThreadFunc(slice, fmt);
         });
+
         return true;
+    }
+
+    void PrefillBuffer(const std::vector<uint8_t>& slice, const WAVEFORMATEX& fmt)
+    {
+        UINT32 bufferFrames = 0;
+        pClient->GetBufferSize(&bufferFrames);
+
+        int    frameBytes    = fmt.nBlockAlign;
+        UINT32 framesToWrite = (UINT32)std::min(
+            (size_t)bufferFrames,
+            slice.size() / (size_t)frameBytes
+        );
+
+        BYTE *pData = nullptr;
+        if (SUCCEEDED(pRender->GetBuffer(framesToWrite, &pData)))
+        {
+            memcpy(pData, slice.data(), framesToWrite * frameBytes);
+            cursor = framesToWrite * frameBytes;
+            pRender->ReleaseBuffer(framesToWrite, 0);
+        }
     }
 
     void ThreadFunc(const std::vector<uint8_t>& slice, const WAVEFORMATEX& fmt)
     {
-        totalBytes = slice.size();
-        UINT32 bufferFrames = 0;
-        pClient->GetBufferSize(&bufferFrames); // engine's buffer size
+        int    frameBytes   = fmt.nBlockAlign;
+        HANDLE handles[2]   = { hStop, hEvent };  // hStop first = higher priority
 
-        cursor = 0; // byte offset into slice
-        int frameBytes = fmt.nBlockAlign;
-
-        while (!stopReq && cursor < slice.size())
+        while (true)
         {
-            Sleep(10);
+            // Block here — zero CPU until WASAPI needs data or we're told to stop.
+            // Timeout 200ms guards against a lost wakeup (rare but possible).
+            DWORD result = WaitForMultipleObjects(2, handles, FALSE, 200);
 
-            UINT32 padding = 0;
-            pClient->GetCurrentPadding(&padding); // frames already queued
+            if (result == WAIT_OBJECT_0)        // hStop fired
+                break;
 
-            UINT32 available = bufferFrames - padding; // frames we can write
+            // WAIT_OBJECT_0 + 1 = hEvent, or WAIT_TIMEOUT = safety top-up
+            // Either way, try to fill whatever space is available
+            UINT32 bufferFrames = 0, padding = 0;
+            pClient->GetBufferSize(&bufferFrames);
+            pClient->GetCurrentPadding(&padding);
+
+            UINT32 available = bufferFrames - padding;
             if (available == 0) continue;
 
-            // Don't write more than what's left in the slice
             size_t bytesLeft     = slice.size() - cursor;
             UINT32 framesToWrite = (UINT32)std::min(
                 (size_t)available,
                 bytesLeft / (size_t)frameBytes
             );
-            if (framesToWrite == 0) break;
+
+            if (framesToWrite == 0)
+            {
+                // All data is queued — wait for the engine to drain naturally,
+                // but still respect hStop so we never hang
+                while (true)
+                {
+                    DWORD r = WaitForMultipleObjects(2, handles, FALSE, 10);
+                    if (r == WAIT_OBJECT_0) goto done;  // Stop() called
+                    pClient->GetCurrentPadding(&padding);
+                    if (padding == 0) break;
+                }
+                break;
+            }
 
             BYTE *pData = nullptr;
             if (FAILED(pRender->GetBuffer(framesToWrite, &pData))) break;
-
             memcpy(pData, slice.data() + cursor, framesToWrite * frameBytes);
             cursor += framesToWrite * frameBytes;
-
             pRender->ReleaseBuffer(framesToWrite, 0);
         }
 
-    // Wait for the engine buffer to fully drain instead of a blind Sleep(200)
-    if (!stopReq)
-    {
-        UINT32 padding = 0;
-        while (!stopReq)
-        {
-            Sleep(10);
-            pClient->GetCurrentPadding(&padding);
-            if (padding == 0) break;
-        }
-    }
+        done:
         pClient->Stop();
         playing = false;
     }
 
+    int64_t FramesDone(uint32_t sampleRate) const
+    {
+        if (!playing.load() || !pClock) return -1;
+
+        UINT64 freq = 0, pos = 0;
+        pClock->GetFrequency(&freq);
+        pClock->GetPosition(&pos, nullptr);
+
+        if (freq == 0) return -1;
+
+        return (int64_t)((double)pos / (double)freq * sampleRate);
+    }
+
     void Stop()
     {
-        stopReq = true;
-        if (thread.joinable()) thread.join();
-    if (pClock)  { pClock->Release();  pClock  = nullptr; }  // add this
-        if (pClient)  { pClient->Stop(); pClient->Release();  pClient  = nullptr; }
-        if (pRender)  { pRender->Release(); pRender = nullptr; }
+        if (hStop) SetEvent(hStop);          // unblocks WaitForMultipleObjects instantly
+        if (thread.joinable()) thread.join(); // thread exits on next iteration, very fast
+        Cleanup();
+    }
+
+    void Cleanup()
+    {
+        if (pClock)  { pClock->Release();  pClock  = nullptr; }
+        if (pRender) { pRender->Release(); pRender = nullptr; }
+        if (pClient) { pClient->Release(); pClient = nullptr; }
+        if (hEvent)  { CloseHandle(hEvent); hEvent = nullptr; }
+        if (hStop)   { CloseHandle(hStop);  hStop  = nullptr; }
     }
 };
 
 static void DrawWaveform(ImDrawList                 *dl,
-                         ImVec2                     canvasPos,
-                         float                      canvasW,
-                         float                      canvasH,
-                         const std::vector<uint8_t> &snap,
+                         ImVec2                     canvas_pos,
+                         float                      canvas_w,
+                         float                      canvas_h,
+                         const std::vector<uint8_t> &snapshot,
                          const WAVEFORMATEX         &fmt,
                          RecState                   rs,
-                         int64_t                    *selF0,   
-                         int64_t                    *selF1)  
+                         int64_t                    *sel_start_frame,   
+                         int64_t                    *sel_end_frame)  
 {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     ImGuiID id = window->GetID("waveform_crop");
     ImGuiContext& g = *GImGui;
 
     // draw the waveform backgrouond rect
-    dl->AddRectFilled(canvasPos,
-                      ImVec2(canvasPos.x + canvasW, canvasPos.y + canvasH),
+    dl->AddRectFilled(canvas_pos,
+                      ImVec2(canvas_pos.x + canvas_w, canvas_pos.y + canvas_h),
                       IM_COL32(18, 18, 22, 255));
     
 
-    ImRect canvas_bb(canvasPos, ImVec2(canvasPos.x + canvasW, canvasPos.y + canvasH));
+    ImRect canvas_bb(canvas_pos, ImVec2(canvas_pos.x + canvas_w, canvas_pos.y + canvas_h));
     ImGui::ItemSize(canvas_bb);
     if (!ImGui::ItemAdd(canvas_bb, id))
         return;
@@ -775,26 +828,26 @@ static void DrawWaveform(ImDrawList                 *dl,
     bool hovered = ImGui::ItemHoverable(canvas_bb, id, g.LastItemData.ItemFlags);
 
     // draw the center line
-    float cy = canvasPos.y + canvasH * 0.5f;
-    dl->AddLine(ImVec2(canvasPos.x, cy),
-                ImVec2(canvasPos.x + canvasW, cy),
+    float cy = canvas_pos.y + canvas_h * 0.5f;
+    dl->AddLine(ImVec2(canvas_pos.x, cy),
+                ImVec2(canvas_pos.x + canvas_w, cy),
                 IM_COL32(45, 45, 55, 255));
 
     const int channels     = (fmt.nChannels     > 0) ? (int)fmt.nChannels     : 2;
     const int bytesPerSamp = (fmt.wBitsPerSample > 0) ? (int)(fmt.wBitsPerSample / 8) : 2;
     const int frameBytes   = channels * bytesPerSamp;
 
-    size_t snapFrames = (frameBytes > 0) ? snap.size() / (size_t)frameBytes : 0;
+    size_t snapshot_frames = (frameBytes > 0) ? snapshot.size() / (size_t)frameBytes : 0;
 
-    if (snapFrames < 2 || canvasW < 2.f)
+    if (snapshot_frames < 2 || canvas_w < 2.f)
     {
-        dl->AddLine(ImVec2(canvasPos.x + canvasW * 0.3f, cy),
-                    ImVec2(canvasPos.x + canvasW * 0.7f, cy),
+        dl->AddLine(ImVec2(canvas_pos.x + canvas_w * 0.3f, cy),
+                    ImVec2(canvas_pos.x + canvas_w * 0.7f, cy),
                     IM_COL32(60, 60, 70, 180), 1.f);
         return;
     }
 
-    int cols = (int)canvasW;
+    int cols = (int)canvas_w;
 
     ImU32 waveColSel  =
         (rs == RecState::Recording)    ? IM_COL32(85,  189,  253, 230) :
@@ -804,29 +857,29 @@ static void DrawWaveform(ImDrawList                 *dl,
     ImU32 waveColDim  = IM_COL32(60, 60, 70, 130);
 
     // associating the handles with pos inside the array of samples
-    float samples_start_ratio = ((float)(*selF0) / (float)snapFrames);
-    float samples_end_ratio = ((float)(*selF1) / (float)snapFrames);
+    float samples_start_ratio = ((float)(*sel_start_frame) / (float)snapshot_frames);
+    float samples_end_ratio = ((float)(*sel_end_frame) / (float)snapshot_frames);
 
-    if (selF1 > selF0 && (int64_t)snapFrames > 0)
+    if (sel_end_frame > sel_start_frame && (int64_t)snapshot_frames > 0)
     {
-        float x0sel = canvasPos.x + (float)canvasW * samples_start_ratio;
-        float x1sel = canvasPos.x + (float)canvasW * samples_end_ratio;
-        x0sel = ImMax(x0sel, canvasPos.x);
-        x1sel = ImMin(x1sel, canvasPos.x + canvasW);
+        float x0sel = canvas_pos.x + (float)canvas_w * samples_start_ratio;
+        float x1sel = canvas_pos.x + (float)canvas_w * samples_end_ratio;
+        x0sel = ImMax(x0sel, canvas_pos.x);
+        x1sel = ImMin(x1sel, canvas_pos.x + canvas_w);
         // selected portion
-        dl->AddRectFilled(ImVec2(x0sel, canvasPos.y),
-                          ImVec2(x1sel, canvasPos.y + canvasH),
+        dl->AddRectFilled(ImVec2(x0sel, canvas_pos.y),
+                          ImVec2(x1sel, canvas_pos.y + canvas_h),
                           IM_COL32(80, 200, 120, 18));
     }
 
     for (int col = 0; col < cols; ++col)
     {
-        size_t f0 = (size_t)((double)col       / cols * snapFrames);
-        size_t f1 = (size_t)((double)(col + 1) / cols * snapFrames);
+        size_t f0 = (size_t)((double)col       / cols * snapshot_frames);
+        size_t f1 = (size_t)((double)(col + 1) / cols * snapshot_frames);
 
         // at least a sing sample per column make sure not out of bounds
         if (f1 <= f0) f1 = f0 + 1;
-        if (f1 > snapFrames) f1 = snapFrames;
+        if (f1 > snapshot_frames) f1 = snapshot_frames;
 
         float peak_min =  1.f;
         float peak_max = -1.f;
@@ -838,19 +891,20 @@ static void DrawWaveform(ImDrawList                 *dl,
             for (int ch = 0; ch < channels; ++ch)
             {
                 size_t byteOff = f * (size_t)frameBytes + (size_t)(ch * bytesPerSamp);
+
                 float s = 0.f;
                 if (bytesPerSamp == 2)
                 {
                     // 16-bit pcm Converts signed int16 → float [-1, 1]
                     int16_t raw;
-                    memcpy(&raw, snap.data() + byteOff, 2);
+                    memcpy(&raw, snapshot.data() + byteOff, 2);
                     s = raw / 32768.f;
                 }
                 else if (bytesPerSamp == 4)
                 {
                     // 32-bit float PCM:
                     float raw;
-                    memcpy(&raw, snap.data() + byteOff, 4);
+                    memcpy(&raw, snapshot.data() + byteOff, 4);
                     s = raw;
                 }
                 mixed += s;
@@ -865,9 +919,9 @@ static void DrawWaveform(ImDrawList                 *dl,
         peak_min = ImClamp(peak_min, -1.0f, 1.0f);
         peak_max = ImClamp(peak_max, -1.0f, 1.0f);
 
-        float x  = canvasPos.x + (float)col;
-        float y0 = canvasPos.y + (1.f - peak_max) * 0.5f * canvasH; // top 
-        float y1 = canvasPos.y + (1.f - peak_min) * 0.5f * canvasH; // bottom
+        float x  = canvas_pos.x + (float)col;
+        float y0 = canvas_pos.y + (1.f - peak_max) * 0.5f * canvas_h; // top 
+        float y1 = canvas_pos.y + (1.f - peak_min) * 0.5f * canvas_h; // bottom
 
         // at least one pixel if silent
         if (y1 - y0 < 1.f) 
@@ -879,17 +933,17 @@ static void DrawWaveform(ImDrawList                 *dl,
 
         // this portion of the wave form is inside the selection
         bool inSel = true;
-        if (selF1 > selF0 && (int64_t)snapFrames > 0)
+        if (sel_end_frame > sel_start_frame && (int64_t)snapshot_frames > 0)
         {
             int64_t colFrame = (int64_t)f0; /* representative frame for this col */
-            inSel = (colFrame >= *selF0 && colFrame < *selF1);
+            inSel = (colFrame >= *sel_start_frame && colFrame < *sel_end_frame);
         }
         dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), 
                     ((rs == RecState::Recording) || inSel) ? waveColSel : waveColDim, 1.f);
     }
 
-    float xStart = canvasPos.x + (float)canvasW * samples_start_ratio;
-    float xEnd   = canvasPos.x + (float)canvasW * samples_end_ratio;
+    float xStart = canvas_pos.x + (float)canvas_w * samples_start_ratio;
+    float xEnd   = canvas_pos.x + (float)canvas_w * samples_end_ratio;
 
     enum DragTarget { None, Start, End };
     static DragTarget active = None;
@@ -909,20 +963,20 @@ static void DrawWaveform(ImDrawList                 *dl,
 
     if (ImGui::GetActiveID() == id && ImGui::IsMouseDown(0))
     {
-        float t = (mx - canvasPos.x) / canvasW;
+        float t = (mx - canvas_pos.x) / canvas_w;
         t = ImClamp(t, 0.0f, 1.0f);
 
-        int64_t frame = (int64_t)(t * snapFrames);
+        int64_t frame = (int64_t)(t * snapshot_frames);
 
         if (active == Start)
         {
-            *selF0 = frame;
-            if (*selF0 > *selF1) *selF0 = *selF1;
+            *sel_start_frame = frame;
+            if (*sel_start_frame > *sel_end_frame) *sel_start_frame = *sel_end_frame;
         }
         else if (active == End)
         {
-            *selF1 = frame;
-            if (*selF1 < *selF0) *selF1 = *selF0;
+            *sel_end_frame = frame;
+            if (*sel_end_frame < *sel_start_frame) *sel_end_frame = *sel_start_frame;
         }
     }
     else if (!ImGui::IsMouseDown(0))
@@ -932,20 +986,20 @@ static void DrawWaveform(ImDrawList                 *dl,
             ImGui::ClearActiveID();
     }
     // draw the handles
-    if (rs == RecState::ReadyToExport && *selF1 > *selF0 && (int64_t)snapFrames > 0)
+    if (rs == RecState::ReadyToExport && *sel_end_frame > *sel_start_frame && (int64_t)snapshot_frames > 0)
     {
         auto drawHandle = [&](int64_t frame, ImU32 col)
         {
-            float x = canvasPos.x + (float)canvasW * ((float)frame / (float)snapFrames);
+            float x = canvas_pos.x + (float)canvas_w * ((float)frame / (float)snapshot_frames);
 
-            dl->AddLine(ImVec2(x, canvasPos.y),
-                        ImVec2(x, canvasPos.y + canvasH),
+            dl->AddLine(ImVec2(x, canvas_pos.y),
+                        ImVec2(x, canvas_pos.y + canvas_h),
                         col, 2.f);
 
             dl->AddCircleFilled(ImVec2(x, cy), 3.5f, col);
         };
-        drawHandle(*selF0, IM_COL32(80, 220, 120, 220));   /* green start */
-        drawHandle(*selF1, IM_COL32(220, 100, 60, 220));   /* orange end  */
+        drawHandle(*sel_start_frame, IM_COL32(80, 220, 120, 220));   /* green start */
+        drawHandle(*sel_end_frame, IM_COL32(220, 100, 60, 220));   /* orange end  */
     }
 }
 
@@ -1016,53 +1070,53 @@ inline float CalcHBlockItemWidth(int count)
 
 struct RecorderWindow
 {
-    Recorder                      rec;
-    Player player;
+    Recorder                      recorder;
+    Player                        player;
     RecState                      rs = RecState::Idle; 
     std::vector<ProcEntry>        procs;
-    int                           selProc = 0;
-    char                          procFilter[128];
-    std::vector<uint8_t>          snap;
-    RecState                      lastRs = RecState::Idle;
-    ProcEntry                     fg;
-    DWORD                         lastPollTick = 0;
-    ImGuiTextFilter               filter;
+    int                           self_proc = 0;        // dont choose it for recording
+    char                          proc_filter[128];
+    std::vector<uint8_t>          snapshot;
+    RecState                      prev_rs = RecState::Idle;
+    ProcEntry                     fg_proc;              // current foregrounf proc
+    DWORD                         last_poll_tick = 0;   // to poll each x amount for anything
+    ImGuiTextFilter               text_filter;
 
-    DWORD s;
-    DWORD h;
-    DWORD m;
+    DWORD                         s;
+    DWORD                         h;
+    DWORD                         m;
 
-    ImVec4 startCol         = ImVec4(0.15f, 0.55f, 0.25f, 1.f);
-    ImVec4 startHoverCol    = ImVec4(0.20f, 0.70f, 0.30f, 1.f);
-    ImVec4 startActiveCol   = ImVec4(0.10f, 0.40f, 0.18f, 1.f);
+    ImVec4 start_col            = ImVec4(0.15f, 0.55f, 0.25f, 1.f);
+    ImVec4 start_hover_col      = ImVec4(0.20f, 0.70f, 0.30f, 1.f);
+    ImVec4 start_active_col     = ImVec4(0.10f, 0.40f, 0.18f, 1.f);
 
-    ImVec4 pauseCol         = ImVec4(0.15f, 0.45f, 0.75f, 1.f);
-    ImVec4 pauseHoverCol    = ImVec4(0.20f, 0.60f, 0.95f, 1.f);
-    ImVec4 pauseActiveCol   = ImVec4(0.10f, 0.35f, 0.55f, 1.f);
+    ImVec4 pause_col         = ImVec4(0.15f, 0.45f, 0.75f, 1.f);
+    ImVec4 pause_hover_col    = ImVec4(0.20f, 0.60f, 0.95f, 1.f);
+    ImVec4 pause_active_col   = ImVec4(0.10f, 0.35f, 0.55f, 1.f);
 
-    ImVec4 resumeCol        = ImVec4(0.15f, 0.45f, 0.75f, 1.f);
-    ImVec4 resumeHoverCol   = ImVec4(0.20f, 0.60f, 0.95f, 1.f);
-    ImVec4 resumeActiveCol  = ImVec4(0.10f, 0.35f, 0.55f, 1.f);
+    ImVec4 resume_col        = ImVec4(0.15f, 0.45f, 0.75f, 1.f);
+    ImVec4 resume_hover_col   = ImVec4(0.20f, 0.60f, 0.95f, 1.f);
+    ImVec4 resume_active_col  = ImVec4(0.10f, 0.35f, 0.55f, 1.f);
 
-    ImVec4 stopCol          = ImVec4(0.65f, 0.15f, 0.15f, 1.f);
-    ImVec4 stopHoverCol     = ImVec4(0.85f, 0.20f, 0.20f, 1.f);
-    ImVec4 stopActiveCol    = ImVec4(0.45f, 0.10f, 0.10f, 1.f);
+    ImVec4 stop_col          = ImVec4(0.65f, 0.15f, 0.15f, 1.f);
+    ImVec4 stop_hover_col     = ImVec4(0.85f, 0.20f, 0.20f, 1.f);
+    ImVec4 stop_active_col    = ImVec4(0.45f, 0.10f, 0.10f, 1.f);
 
-    ImVec4 saveCol          = ImVec4(0.15f, 0.55f, 0.25f, 1.f);
-    ImVec4 saveHoverCol     = ImVec4(0.20f, 0.70f, 0.30f, 1.f);
-    ImVec4 saveActiveCol    = ImVec4(0.10f, 0.40f, 0.18f, 1.f);
+    ImVec4 save_col          = ImVec4(0.15f, 0.55f, 0.25f, 1.f);
+    ImVec4 save_hover_col     = ImVec4(0.20f, 0.70f, 0.30f, 1.f);
+    ImVec4 save_active_col    = ImVec4(0.10f, 0.40f, 0.18f, 1.f);
 
-    ImVec4 discardCol       = ImVec4(0.60f, 0.15f, 0.15f, 1.f);
-    ImVec4 discardHoverCol  = ImVec4(0.80f, 0.20f, 0.20f, 1.f);
-    ImVec4 discardActiveCol = ImVec4(0.45f, 0.10f, 0.10f, 1.f);
+    ImVec4 discard_col       = ImVec4(0.60f, 0.15f, 0.15f, 1.f);
+    ImVec4 discard_hover_col  = ImVec4(0.80f, 0.20f, 0.20f, 1.f);
+    ImVec4 discard_active_col = ImVec4(0.45f, 0.10f, 0.10f, 1.f);
 
-    ImVec4 selectCol        = ImVec4(0.15f,0.40f,0.60f,1.f);
-    ImVec4 selectHoverCol   = ImVec4(0.20f,0.55f,0.80f,1.f);
-    ImVec4 selectActiveCol  = ImVec4(0.10f,0.28f,0.45f,1.f);
+    ImVec4 select_col        = ImVec4(0.15f,0.40f,0.60f,1.f);
+    ImVec4 select_hover_col   = ImVec4(0.20f,0.55f,0.80f,1.f);
+    ImVec4 select_active_col  = ImVec4(0.10f,0.28f,0.45f,1.f);
 
-    void DrawTimer()
+    void DrawTimer(void)
     {
-        s  = (DWORD)rec.recordSecs;
+        s  = (DWORD)recorder.recordSecs;
         h  = s / 3600; s %= 3600;
         m  = s / 60;   s %= 60;
         char buf[32];
@@ -1072,7 +1126,7 @@ struct RecorderWindow
         ImGui::SetWindowFontScale(1.0f);
     }
 
-    void DrawRecordingStateIndicator()
+    void DrawRecordingStateIndicator(void)
     {
         if (rs == RecState::Recording) 
         {
@@ -1092,34 +1146,34 @@ struct RecorderWindow
         }
     }
 
-    void DrawRecordingController()
+    void DrawRecordingController(void)
     {
         float width = CalcHBlockItemWidth(3);
 
         ImGui::BeginDisabled(!(rs == RecState::Idle) || procs.empty());
             if (ButtonColored("▶  Start", ImVec2(width, 40),
-                            startCol, startHoverCol, startActiveCol))
+                            start_col, start_hover_col, start_active_col))
             {
-                DWORD pid = procs.empty() ? 0 : procs[selProc].pid;
-                if (!rec.Start(pid))
-                    rec.statusMsg = "Failed to start. " + rec.statusMsg;
+                DWORD pid = procs.empty() ? 0 : procs[self_proc].pid;
+                if (!recorder.Start(pid))
+                    recorder.statusMsg = "Failed to start. " + recorder.statusMsg;
             }
         ImGui::EndDisabled();
 
         ImGui::SameLine();
 
         /* Pause / Resume */
-        bool canPause = (rs == RecState::Recording || rs == RecState::Paused);
-        bool isPaused = (rs == RecState::Paused); 
+        bool can_pause = (rs == RecState::Recording || rs == RecState::Paused);
+        bool is_paused = (rs == RecState::Paused); 
 
-        ImGui::BeginDisabled(!canPause);
-            if (ButtonColored((isPaused) ? "▶  Resume" : "⏸  Pause",
+        ImGui::BeginDisabled(!can_pause);
+            if (ButtonColored((is_paused) ? "▶  Resume" : "⏸  Pause",
                             ImVec2(width, 40),
-                            (isPaused)? resumeCol: pauseCol,
-                            (isPaused)? resumeHoverCol: pauseHoverCol,
-                            (isPaused)? resumeActiveCol: pauseActiveCol))
+                            (is_paused)? resume_col: pause_col,
+                            (is_paused)? resume_hover_col: pause_hover_col,
+                            (is_paused)? resume_active_col: pause_active_col))
             {
-                rec.TogglePause();
+                recorder.TogglePause();
             }
         ImGui::EndDisabled();
 
@@ -1127,46 +1181,49 @@ struct RecorderWindow
 
         ImGui::BeginDisabled(rs == RecState::Idle);
             if(ButtonColored("■  Stop", ImVec2(width, 40), 
-                            stopCol, stopHoverCol, stopActiveCol))
+                            stop_col, stop_hover_col, stop_active_col))
             {
-                rec.Stop();
+                recorder.Stop();
             }
         ImGui::EndDisabled();
 
     }
 
-    void DrawCaptureStatusInfo()
+    void DrawCaptureStatusInfo(void)
     {
         size_t bytes;
         { 
-            std::lock_guard<std::mutex> lk(rec.pcmMtx);
-            bytes = rec.pcm.size(); 
+            std::lock_guard<std::mutex> lk(recorder.pcmMtx);
+            bytes = recorder.pcm.size(); 
         }
+
         char buf[128];
         snprintf(buf, sizeof(buf),
                 "Captured: %.1f MB   |   %u Hz / %u-bit / %uch",
                 bytes / 1048576.0,
-                (unsigned)rec.capFmt.nSamplesPerSec,
-                (unsigned)rec.capFmt.wBitsPerSample,
-                (unsigned)rec.capFmt.nChannels);
+                (unsigned)recorder.capFmt.nSamplesPerSec,
+                (unsigned)recorder.capFmt.wBitsPerSample,
+                (unsigned)recorder.capFmt.nChannels);
+
         TextCenteredColored(buf, ImVec4(0.5f, 0.8f, 0.5f, 1.f));
     }
 
-    void DrawExportController()
+    void DrawExportController(void)
     {
-        if (lastRs != RecState::ReadyToExport)
+        if (prev_rs != RecState::ReadyToExport)
         {
-            std::lock_guard<std::mutex> lk(rec.pcmMtx);
-            snap = rec.pcm;
+            // lock it and capture its state to draw
+            std::lock_guard<std::mutex> lk(recorder.pcmMtx);
+            snapshot = recorder.pcm;
         }
-        lastRs = rs;
+        prev_rs = rs;
 
         float w = CalcHBlockItemWidth(2);
-        bool hasRange = (rec.cropFrameEnd > rec.cropFrameStart);
+        bool hasRange = (recorder.cropFrameEnd > recorder.cropFrameStart);
 
         ImGui::BeginDisabled(!hasRange);
             if(ButtonColored("Save WAV", ImVec2(w, 40), 
-                            saveCol, saveHoverCol, saveActiveCol))
+                            save_col, save_hover_col, save_active_col))
             {
                 nfdchar_t  *outPath = nullptr;
                 nfdfilteritem_t filters[] = {{ "WAV Audio", "wav" }};
@@ -1180,32 +1237,32 @@ struct RecorderWindow
                     }
 
                     // nBlockAlign is the number of bytes per frame. 
-                    size_t frameBytes  = (size_t)rec.capFmt.nBlockAlign;
-                    size_t byteStart   = (size_t)rec.cropFrameStart * frameBytes;
-                    size_t byteEnd     = (size_t)rec.cropFrameEnd   * frameBytes;
+                    size_t frameBytes  = (size_t)recorder.capFmt.nBlockAlign;
+                    size_t byteStart   = (size_t)recorder.cropFrameStart * frameBytes;
+                    size_t byteEnd     = (size_t)recorder.cropFrameEnd   * frameBytes;
 
-                    if (byteEnd > snap.size()){
-                        byteEnd = snap.size();
+                    if (byteEnd > snapshot.size()){
+                        byteEnd = snapshot.size();
                     }
 
-                    if (Wav::ExportRange(path, snap, byteStart, byteEnd, rec.capFmt))
+                    if (Wav::ExportRange(path, snapshot, byteStart, byteEnd, recorder.capFmt))
                     {
-                        rec.statusMsg = "Saved: " + path;
+                        recorder.statusMsg = "Saved: " + path;
                         /* Clear and return to Idle */
                         player.Stop();
-                        snap.clear();
-                        lastRs = RecState::Idle;
-                        rec.Discard();
+                        snapshot.clear();
+                        prev_rs = RecState::Idle;
+                        recorder.Discard();
                     }
                     else
                     {
-                        rec.statusMsg = "Save failed!";
+                        recorder.statusMsg = "Save failed!";
                     }
                     NFD_FreePath(outPath);
                 }
                 else
                 {
-                    rec.statusMsg = "Save cancelled.";
+                    recorder.statusMsg = "Save cancelled.";
                 }
 
             }
@@ -1213,26 +1270,26 @@ struct RecorderWindow
 
         ImGui::SameLine();
 
-        if(ButtonColored("Discard", ImVec2(w, 40), discardCol, discardHoverCol, discardActiveCol))
+        if(ButtonColored("Discard", ImVec2(w, 40), discard_col, discard_hover_col, discard_active_col))
         {
             player.Stop();
-            snap.clear();
-            lastRs = RecState::Idle;
-            rec.Discard();
+            snapshot.clear();
+            prev_rs = RecState::Idle;
+            recorder.Discard();
         }
     }
 
-    void DrawStatusMessage()
+    void DrawStatusMessage(void)
     {
-        if (!rec.statusMsg.empty()) {
+        if (!recorder.statusMsg.empty()) {
             ImGui::Spacing();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.5f, 1.f));
-            ImGui::TextWrapped("%s", rec.statusMsg.c_str());
+            ImGui::TextWrapped("%s", recorder.statusMsg.c_str());
             ImGui::PopStyleColor();
         }
     }
 
-    void DrawWaveformEditor()
+    void DrawWaveformEditor(void)
     {
         const float WAVE_H = 100.0f;
         const float panelW = ImGui::GetContentRegionAvail().x;
@@ -1240,48 +1297,47 @@ struct RecorderWindow
         ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
         ImDrawList *dl = ImGui::GetWindowDrawList();
 
-        std::vector<uint8_t> displaySnap;
-
-        std::lock_guard<std::mutex> lk(rec.pcmMtx);
-        displaySnap = rec.pcm;
+        std::vector<uint8_t> display_snapshot;
+        {
+            std::lock_guard<std::mutex> lk(recorder.pcmMtx);
+            display_snapshot = recorder.pcm;
+        }
 
         DrawWaveform(dl, canvas_pos, panelW, WAVE_H,
-                     displaySnap, rec.capFmt, rs, &rec.cropFrameStart, &rec.cropFrameEnd);
+                     display_snapshot, recorder.capFmt, rs, &recorder.cropFrameStart, &recorder.cropFrameEnd);
 
-if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
-    int64_t snapFrames = (int64_t)(displaySnap.size() / (size_t)rec.capFmt.nBlockAlign);
-    if (snapFrames > 0) {
-        UINT64 freq = 0, pos = 0;
-        player.pClock->GetFrequency(&freq);
-        player.pClock->GetPosition(&pos, nullptr);
+        int64_t frames_done      = player.FramesDone(recorder.capFmt.nSamplesPerSec);
+        int64_t snapshot_frames  = (int64_t)(display_snapshot.size() / (size_t)recorder.capFmt.nBlockAlign);
+        int64_t selection_frames = recorder.cropFrameEnd - recorder.cropFrameStart;
 
-        if (freq > 0) {
-            // pos/freq = seconds played, convert to frames
-            int64_t framesDone = (int64_t)((double)pos / (double)freq
-                                           * rec.capFmt.nSamplesPerSec);
-            int64_t selFrames  = rec.cropFrameEnd - rec.cropFrameStart;
-            framesDone = std::min(framesDone, selFrames);
+        // drawing selection player indication
+        if (frames_done >= 0 && recorder.capFmt.nBlockAlign > 0)
+        {
+            if (snapshot_frames > 0)
+            {
+                frames_done = std::min(frames_done, selection_frames);
 
-            float absFrame = (float)(rec.cropFrameStart + framesDone);
-            float px = canvas_pos.x + (absFrame / (float)snapFrames) * panelW;
+                float absFrame = (float)(recorder.cropFrameStart + frames_done);
+                float px = canvas_pos.x + (absFrame / (float)snapshot_frames) * panelW;
 
-            dl->AddLine(ImVec2(px, canvas_pos.y),
-                        ImVec2(px, canvas_pos.y + WAVE_H),
-                        IM_COL32(255, 220, 60, 220), 1.5f);
+                dl->AddLine(ImVec2(px, canvas_pos.y),
+                            ImVec2(px, canvas_pos.y + WAVE_H),
+                            IM_COL32(255, 220, 60, 220), 1.5f);
+            }
         }
     }
-}
-    }
-    void DrawPlaybackController()
+
+    void DrawPlaybackController(void)
     {
         bool isPlaying = player.playing.load();
         float w2 = CalcHBlockItemWidth(2);
 
-        ImGui::BeginDisabled(isPlaying || !(rec.cropFrameEnd > rec.cropFrameStart));
-            if (ImGui::Button("▶  Play Selection", ImVec2(w2, 36))) {
+        ImGui::BeginDisabled(isPlaying || !(recorder.cropFrameEnd > recorder.cropFrameStart));
+            if (ImGui::Button("▶  Play Selection", ImVec2(w2, 36))) 
+            {
                 player.Stop();
-                std::lock_guard<std::mutex> lk(rec.pcmMtx);
-                player.Start(snap, rec.capFmt, rec.cropFrameStart, rec.cropFrameEnd);
+                std::lock_guard<std::mutex> lk(recorder.pcmMtx);
+                player.Start(snapshot, recorder.capFmt, recorder.cropFrameStart, recorder.cropFrameEnd);
             }
         ImGui::EndDisabled();
 
@@ -1289,18 +1345,21 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
 
         ImGui::BeginDisabled(!isPlaying);
             if (ButtonColored("■  Stop Playback", ImVec2(w2, 36),
-                            stopCol, stopHoverCol, stopActiveCol))
+                            stop_col, stop_hover_col, stop_active_col))
+            {
                 player.Stop();
+            }
         ImGui::EndDisabled();
     }
-    void DrawProcFgSelect()
+
+    void DrawProcFgSelect(void)
     {
         if(!(rs == RecState::ReadyToExport))
         {
-            bool isSelf = (fg.pid == GetCurrentProcessId());
+            bool isSelf = (fg_proc.pid == GetCurrentProcessId());
 
             char fgBuf[MAX_PATH + 64];
-            if (isSelf || !fg.pid)
+            if (isSelf || !fg_proc.pid)
             {
                 snprintf(fgBuf, sizeof(fgBuf), "Active window:  (this recorder)");
             }
@@ -1308,7 +1367,7 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
             {
                 snprintf(fgBuf, sizeof(fgBuf),
                         "Active window:  %s   [PID %lu]",
-                        fg.name.c_str()[0] ? fg.name.c_str() : "?", (unsigned long)fg.pid);
+                        fg_proc.name.c_str()[0] ? fg_proc.name.c_str() : "?", (unsigned long)fg_proc.pid);
             }
 
             ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -1323,20 +1382,22 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
                 TextCenteredColored(fgBuf,isSelf ? ImVec4(0.45f, 0.45f, 0.45f, 1.f)
                 : ImVec4(0.55f, 0.85f, 1.00f, 1.f),fg_proc_status_h);
 
-                if (!isSelf && fg.pid && (rs == RecState::Idle))
+                if (!isSelf && fg_proc.pid && (rs == RecState::Idle))
                 {
                     ImGui::SameLine(ImGui::GetContentRegionAvail().x
                             - ImGui::CalcTextSize("Select").x - 16.f);
-                    if(ButtonColored("Select", ImVec2(0, 30), selectCol, selectHoverCol, selectActiveCol))
+                    if(ButtonColored("Select", ImVec2(0, 30), select_col, select_hover_col, select_active_col))
                     {
                         auto findPid = [&]() -> bool {
                             for (int i = 0; i < (int)procs.size(); ++i)
-                                if (procs[i].pid == fg.pid) { selProc = i; return true; }
+                            {
+                                if (procs[i].pid == fg_proc.pid) { self_proc = i; return true; }
+                            }
                             return false;
                         };
                         if (!findPid()) {
                             procs = EnumProcesses();
-                            procFilter[0] = '\0';
+                            proc_filter[0] = '\0';
                             findPid();
                         }
                     }
@@ -1347,7 +1408,7 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
         }
     }
 
-    void DrawProcSelect()
+    void DrawProcSelect(void)
     {
         if (!(rs==RecState::ReadyToExport))
         {
@@ -1356,17 +1417,17 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
                 if (ImGui::Button("↺ Refresh processes"))
                 {
                     procs    = EnumProcesses();
-                    selProc  = 0;
-                    procFilter[0] = '\0';
+                    self_proc  = 0;
+                    proc_filter[0] = '\0';
                 }
                 ImGui::SameLine();
 
-                filter.Draw("##filter", 200.0f); 
+                text_filter.Draw("##filter", 200.0f); 
 
                 std::vector<int> filtered;
                 for (int i = 0; i < (int)procs.size(); ++i)
                 {
-                    if (filter.PassFilter(procs[i].label.c_str()))
+                    if (text_filter.PassFilter(procs[i].label.c_str()))
                     {
                         filtered.push_back(i);
                     }
@@ -1375,7 +1436,7 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
                 bool selVisible = false;
                 for (int fi : filtered)
                 {
-                    if (fi == selProc) 
+                    if (fi == self_proc) 
                     { 
                         selVisible = true;
                         break; 
@@ -1383,18 +1444,18 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
                 }
                 if (!selVisible && !filtered.empty())
                 {
-                    selProc = filtered[0];
+                    self_proc = filtered[0];
                 }
 
-                const char *preview = procs.empty() ? "(none)" : procs[selProc].label.c_str();
+                const char *preview = procs.empty() ? "(none)" : procs[self_proc].label.c_str();
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::BeginCombo("##proc", preview))
                 {
                     for (int fi : filtered)
                     {
-                        bool sel = (fi == selProc);
+                        bool sel = (fi == self_proc);
                         if (ImGui::Selectable(procs[fi].label.c_str(), sel))
-                            selProc = fi;
+                            self_proc = fi;
                         if (sel) {
                             ImGui::SetItemDefaultFocus();
                         }
@@ -1406,27 +1467,27 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
         }
     }
 
-    void Update()
+    void Update(void)
     {
-        rs = rec.state.load();
+        rs = recorder.state.load();
         if (rs == RecState::Recording)
         {
-            rec.recordSecs = rec.pausedSecs +
-                              (GetTickCount() - rec.startTick) / 1000.f;
+            recorder.recordSecs = recorder.pausedSecs +
+                              (GetTickCount() - recorder.startTick) / 1000.f;
         }
 
         DWORD now = GetTickCount();
-        if (now - lastPollTick > 500) { fg = GetForegroundProcessInfo(); lastPollTick = now; }
+        if (now - last_poll_tick > 500) { fg_proc = GetForegroundProcessInfo(); last_poll_tick = now; }
 
     }
 
-    void Init()
+    void Init(void)
     {
         procs   = EnumProcesses();
-        selProc = 0;
+        self_proc = 0;
     }
 
-    void Draw()
+    void Draw(void)
     {
         ImGui::Begin("Audio Recorder");
 
@@ -1482,13 +1543,13 @@ if (player.playing.load() && player.pClock && rec.capFmt.nBlockAlign > 0) {
 
     void Cleanup()
     {
-        RecState cur = rec.state.load();
+        RecState cur = recorder.state.load();
         if (cur == RecState::Recording || cur == RecState::Paused)
         {
-            rec.stopReq = true;
-            if (cur == RecState::Paused && rec.pClient) rec.pClient->Start();
-            if (rec.thread.joinable()) rec.thread.join();
-            rec.Cleanup();
+            recorder.stopReq = true;
+            if (cur == RecState::Paused && recorder.pClient) recorder.pClient->Start();
+            if (recorder.thread.joinable()) recorder.thread.join();
+            recorder.Cleanup();
         }
         player.Stop();
     }
